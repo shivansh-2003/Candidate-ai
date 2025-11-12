@@ -25,6 +25,10 @@ import { useAudioAnalyzer } from './hooks/useAudioAnalyzer';
 type ConnectionState = 'idle' | 'connecting' | 'waiting-agent' | 'connected' | 'reconnecting';
 const AGENT_TIMEOUT_MS = 12000;
 
+// Module-level flag to prevent duplicate connections across React Strict Mode remounts
+let globalConnectionActive = false;
+const STORAGE_KEY = 'livekit_connection_active';
+
 function waitForAgentParticipant(room: Room, timeout = AGENT_TIMEOUT_MS) {
   return new Promise<RemoteParticipant>((resolve, reject) => {
     const existing = Array.from(room.remoteParticipants.values())[0];
@@ -441,12 +445,26 @@ export default function VoiceAgent() {
 
   // Cleanup effect: Reset refs and disconnect on page reload/unmount
   useEffect(() => {
-    // Mark that component is mounted
-    const isMounted = { current: true };
+    // Clear any stale connection flags from previous sessions on mount
+    if (typeof window !== 'undefined') {
+      const staleConnection = sessionStorage.getItem(STORAGE_KEY);
+      if (staleConnection) {
+        console.log('Clearing stale connection flag from previous session');
+        sessionStorage.removeItem(STORAGE_KEY);
+        globalConnectionActive = false;
+      }
+    }
 
     // Handle page reload/close - ensure room is disconnected
     const handleBeforeUnload = () => {
       console.log('Page unloading, disconnecting room');
+
+      // Clear connection flags immediately
+      globalConnectionActive = false;
+      if (typeof window !== 'undefined') {
+        sessionStorage.removeItem(STORAGE_KEY);
+      }
+
       if (roomRef.current) {
         const room = roomRef.current;
         if (room.state === 'connected' || room.state === 'connecting') {
@@ -463,30 +481,41 @@ export default function VoiceAgent() {
     window.addEventListener('beforeunload', handleBeforeUnload);
 
     return () => {
-      // Component is unmounting
-      isMounted.current = false;
       console.log('VoiceAgent unmounting, cleaning up connection state');
 
       // Remove beforeunload listener
       window.removeEventListener('beforeunload', handleBeforeUnload);
 
-      // Reset all connection tracking refs
-      hasConnectedRef.current = false;
-      isConnectingRef.current = false;
-      connectionAttemptedRef.current = false;
-      connectInitiatedRef.current = false;
+      // Only clear flags and disconnect if this is a real unmount (not Strict Mode remount)
+      // We detect this by checking if there's a setTimeout delay
+      const disconnectTimeout = setTimeout(() => {
+        // Reset all connection tracking refs
+        hasConnectedRef.current = false;
+        isConnectingRef.current = false;
+        connectionAttemptedRef.current = false;
+        connectInitiatedRef.current = false;
 
-      // Disconnect room if connected
-      if (roomRef.current) {
-        const room = roomRef.current;
-        if (room.state === 'connected' || room.state === 'connecting') {
-          console.log('Disconnecting room on VoiceAgent unmount');
-          room.disconnect().catch((err) => {
-            console.warn('Error disconnecting room during unmount:', err);
-          });
+        // Clear global flags
+        globalConnectionActive = false;
+        if (typeof window !== 'undefined') {
+          sessionStorage.removeItem(STORAGE_KEY);
         }
-        roomRef.current = null;
-      }
+
+        // Disconnect room if connected
+        if (roomRef.current) {
+          const room = roomRef.current;
+          if (room.state === 'connected' || room.state === 'connecting') {
+            console.log('Disconnecting room on VoiceAgent unmount (delayed)');
+            room.disconnect().catch((err) => {
+              console.warn('Error disconnecting room during unmount:', err);
+            });
+          }
+          roomRef.current = null;
+        }
+      }, 100); // Small delay to allow Strict Mode remount to complete
+
+      // If component remounts before timeout, cleanup won't happen
+      return () => clearTimeout(disconnectTimeout);
     };
   }, []);
 
@@ -643,6 +672,20 @@ export default function VoiceAgent() {
     return null;
   }
 
+  // Prevent duplicate LiveKitRoom renders if connection is already active
+  // This handles React Strict Mode double-mounting in development
+  if (globalConnectionActive && !roomRef.current) {
+    console.log('Connection already active globally, preventing duplicate LiveKitRoom render');
+    return (
+      <div className="flex items-center justify-center min-h-screen">
+        <div className="text-center space-y-4">
+          <div className="animate-spin rounded-full h-16 w-16 border-b-2 border-blue-500 mx-auto"></div>
+          <p className="text-white">Connecting to existing session...</p>
+        </div>
+      </div>
+    );
+  }
+
   // Use a stable key based on sessionId to prevent unnecessary remounts
   // Only change key when we explicitly want a fresh connection
   const roomKey = `room-${sessionId}`;
@@ -661,12 +704,16 @@ export default function VoiceAgent() {
         reconnectPolicy: new DefaultReconnectPolicy(),
       }}
       onConnected={() => {
-        if (hasConnectedRef.current) {
-          console.log('Already connected, skipping duplicate connection');
+        if (hasConnectedRef.current || globalConnectionActive) {
+          console.log('Already connected, skipping duplicate connection setup');
           return;
         }
         console.log('Connected to room');
         hasConnectedRef.current = true;
+        globalConnectionActive = true;
+        if (typeof window !== 'undefined') {
+          sessionStorage.setItem(STORAGE_KEY, 'true');
+        }
         setConnectionState('waiting-agent');
         setConnectionStatus('Connected to room. Waiting for agent…');
       }}
@@ -677,6 +724,12 @@ export default function VoiceAgent() {
         connectionAttemptedRef.current = false; // Reset connection attempt flag
         connectInitiatedRef.current = false; // Reset so we can reconnect
         roomRef.current = null; // Clear room reference
+
+        // Clear global connection flags
+        globalConnectionActive = false;
+        if (typeof window !== 'undefined') {
+          sessionStorage.removeItem(STORAGE_KEY);
+        }
 
         // Optional: Auto-reconnect (skip if user initiated disconnect)
         if (reason !== DisconnectReason.CLIENT_INITIATED && userInteracted) {
