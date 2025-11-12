@@ -28,6 +28,7 @@ const AGENT_TIMEOUT_MS = 12000;
 // Module-level tracking to prevent duplicate connections across React Strict Mode remounts
 let globalConnectionActive = false;
 let lastConnectionAttemptTime = 0;
+let currentMountId: string | null = null; // Track which component instance owns the LiveKitRoom
 const STORAGE_KEY = 'livekit_connection_active';
 const DUPLICATE_THRESHOLD_MS = 100; // Consider renders within 100ms as duplicates (Strict Mode)
 
@@ -422,6 +423,8 @@ export default function VoiceAgent() {
   const connectInitiatedRef = useRef(false);
   const roomRef = useRef<Room | null>(null);
   const hasRenderedLiveKitRef = useRef(false); // Track if this component instance has rendered LiveKitRoom
+  const componentId = useRef(`mount-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`).current;
+  const [canRender, setCanRender] = useState(false); // Track if this component can render LiveKitRoom
 
   // Stable shouldConnect value using useMemo to prevent unnecessary re-renders
   // Based on LiveKit docs: once connect={true}, keep it true to maintain connection
@@ -449,6 +452,32 @@ export default function VoiceAgent() {
 
     return false;
   }, [token, userInteracted, connectionState]);
+
+  // Ownership claim effect: Check if we can claim ownership of LiveKitRoom
+  useEffect(() => {
+    if (!shouldConnect) return;
+
+    // Try to claim ownership
+    if (currentMountId === null || currentMountId === componentId) {
+      // We can render
+      if (!canRender) {
+        console.log(`[${componentId}] Can render LiveKitRoom`);
+        setCanRender(true);
+      }
+    } else {
+      // Another component owns it, wait for ownership to become available
+      console.log(`[${componentId}] Waiting for ownership (current: ${currentMountId})`);
+      const checkInterval = setInterval(() => {
+        if (currentMountId === null || currentMountId === componentId) {
+          console.log(`[${componentId}] Ownership available, claiming it`);
+          setCanRender(true);
+          clearInterval(checkInterval);
+        }
+      }, 5); // Check every 5ms
+
+      return () => clearInterval(checkInterval);
+    }
+  }, [shouldConnect, componentId, canRender]);
 
   // Cleanup effect: Reset refs and disconnect on page reload/unmount
   useEffect(() => {
@@ -498,34 +527,41 @@ export default function VoiceAgent() {
       // Use a very small delay before clearing everything to handle React Strict Mode
       // If the component remounts within this window, the cleanup is cancelled
       const cleanupTimeout = setTimeout(() => {
-        console.log('Executing delayed cleanup after unmount');
+        console.log(`[${componentId}] Executing delayed cleanup after unmount`);
 
-        // Reset all connection tracking refs
-        hasConnectedRef.current = false;
-        isConnectingRef.current = false;
-        connectionAttemptedRef.current = false;
-        connectInitiatedRef.current = false;
+        // Only clear global state if this component still owns it
+        if (currentMountId === componentId) {
+          console.log(`[${componentId}] Clearing global state (owner)`);
+          // Reset all connection tracking refs
+          hasConnectedRef.current = false;
+          isConnectingRef.current = false;
+          connectionAttemptedRef.current = false;
+          connectInitiatedRef.current = false;
 
-        // Clear global flags and timestamps
-        globalConnectionActive = false;
-        lastConnectionAttemptTime = 0;
-        if (typeof window !== 'undefined') {
-          sessionStorage.removeItem(STORAGE_KEY);
-        }
-
-        // Disconnect room if connected
-        if (roomRef.current) {
-          const room = roomRef.current;
-          if (room.state === 'connected' || room.state === 'connecting') {
-            console.log('VoiceAgent: Disconnecting room on delayed cleanup');
-            room.disconnect().catch((err) => {
-              // Ignore "already disconnected" errors
-              if (!err.message || !err.message.includes('already')) {
-                console.warn('Error disconnecting room during unmount:', err);
-              }
-            });
+          // Clear global flags and timestamps
+          globalConnectionActive = false;
+          lastConnectionAttemptTime = 0;
+          currentMountId = null;
+          if (typeof window !== 'undefined') {
+            sessionStorage.removeItem(STORAGE_KEY);
           }
-          roomRef.current = null;
+
+          // Disconnect room if connected
+          if (roomRef.current) {
+            const room = roomRef.current;
+            if (room.state === 'connected' || room.state === 'connecting') {
+              console.log('VoiceAgent: Disconnecting room on delayed cleanup');
+              room.disconnect().catch((err) => {
+                // Ignore "already disconnected" errors
+                if (!err.message || !err.message.includes('already')) {
+                  console.warn('Error disconnecting room during unmount:', err);
+                }
+              });
+            }
+            roomRef.current = null;
+          }
+        } else {
+          console.log(`[${componentId}] Skipping cleanup (not owner, current owner: ${currentMountId})`);
         }
       }, 10); // Very small delay - just enough for Strict Mode double-mount
 
@@ -690,14 +726,26 @@ export default function VoiceAgent() {
     return null;
   }
 
-  // Track that we're rendering LiveKitRoom for logging purposes
-  // In Strict Mode, each component instance (mount) should render its own LiveKitRoom
-  // The cleanup from the first mount will disconnect that room
-  if (shouldConnect && !hasRenderedLiveKitRef.current) {
-    console.log('Rendering LiveKitRoom for this component instance');
-    hasRenderedLiveKitRef.current = true;
+  // Check if we can render LiveKitRoom
+  // Only render if we have permission (canRender is true)
+  if (shouldConnect && !canRender) {
+    // Waiting for ownership to become available
+    console.log(`[${componentId}] Waiting to render LiveKitRoom...`);
+    return (
+      <div className="flex items-center justify-center min-h-screen">
+        <div className="text-center space-y-4">
+          <div className="animate-spin rounded-full h-16 w-16 border-b-2 border-blue-500 mx-auto"></div>
+          <p className="text-white">Initializing voice agent...</p>
+        </div>
+      </div>
+    );
+  }
 
-    // Update global tracking
+  // Claim ownership if we haven't already
+  if (shouldConnect && canRender && !hasRenderedLiveKitRef.current) {
+    console.log(`[${componentId}] Claiming LiveKitRoom ownership and rendering`);
+    currentMountId = componentId;
+    hasRenderedLiveKitRef.current = true;
     lastConnectionAttemptTime = Date.now();
     globalConnectionActive = true;
     if (typeof window !== 'undefined') {
